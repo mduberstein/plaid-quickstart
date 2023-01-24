@@ -1,0 +1,30 @@
+<head>
+	<title>Connect a bank</title>
+	<script src="https://cdn.plaid.com/link/v2/stable/link-initialize.js"></script>
+</head>
+<button id="link-button">Link Account</button>
+
+<script type="text/javascript">
+const linkHandler = Plaid.create({
+  token: "link-sandbox-789362f6-d68a-410d-bb55-486c13ead44d",
+  onSuccess: (public_token, metadata) => {
+    // Send the public_token to your app server.
+    $.post('/exchange_public_token', {
+      public_token: public_token,
+    });
+  },
+  onExit: (err, metadata) => {
+    // Optionally capture when your user exited the Link flow.
+    // Storing this information can be helpful for support.
+  },
+  onEvent: (eventName, metadata) => {
+    // Optionally capture Link flow events, streamed through
+    // this callback as your users connect an Item to Plaid.
+  },
+});
+
+  document.getElementById('link-button').onclick = function() {
+    linkHandler.open();
+  };
+
+</script>
