@@ -6,7 +6,8 @@
 
 <script type="text/javascript">
 const linkHandler = Plaid.create({
-  token: "link-sandbox-789362f6-d68a-410d-bb55-486c13ead44d",
+  // token: "link-sandbox-789362f6-d68a-410d-bb55-486c13ead44d",
+  token: "link-sandbox-7ee9968a-d56b-4e19-9670-278420f807a9",
   onSuccess: (public_token, metadata) => {
     // Send the public_token to your app server.
     $.post('/exchange_public_token', {
