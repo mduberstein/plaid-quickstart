@@ -1,6 +1,15 @@
-# source /Users/tnappy/node_projects/quickstart/python/bin/activate
 # Read env vars from .env file
-from plaid.exceptions import ApiException
+import base64
+import os
+import datetime as dt
+import json
+import time
+from datetime import date, timedelta
+import uuid
+
+from dotenv import load_dotenv
+from flask import Flask, request, jsonify
+import plaid
 from plaid.model.payment_amount import PaymentAmount
 from plaid.model.payment_amount_currency import PaymentAmountCurrency
 from plaid.model.products import Products
@@ -14,6 +23,8 @@ from plaid.model.link_token_create_request_payment_initiation import LinkTokenCr
 from plaid.model.item_public_token_exchange_request import ItemPublicTokenExchangeRequest
 from plaid.model.link_token_create_request import LinkTokenCreateRequest
 from plaid.model.link_token_create_request_user import LinkTokenCreateRequestUser
+from plaid.model.user_create_request import UserCreateRequest
+from plaid.model.consumer_report_user_identity import ConsumerReportUserIdentity
 from plaid.model.asset_report_create_request import AssetReportCreateRequest
 from plaid.model.asset_report_create_request_options import AssetReportCreateRequestOptions
 from plaid.model.asset_report_user import AssetReportUser
@@ -34,47 +45,33 @@ from plaid.model.transfer_create_request import TransferCreateRequest
 from plaid.model.transfer_get_request import TransferGetRequest
 from plaid.model.transfer_network import TransferNetwork
 from plaid.model.transfer_type import TransferType
-from plaid.model.transfer_user_in_request import TransferUserInRequest
+from plaid.model.transfer_authorization_user_in_request import TransferAuthorizationUserInRequest
 from plaid.model.ach_class import ACHClass
 from plaid.model.transfer_create_idempotency_key import TransferCreateIdempotencyKey
 from plaid.model.transfer_user_address_in_request import TransferUserAddressInRequest
+from plaid.model.signal_evaluate_request import SignalEvaluateRequest
+from plaid.model.statements_list_request import StatementsListRequest
+from plaid.model.link_token_create_request_statements import LinkTokenCreateRequestStatements
+from plaid.model.link_token_create_request_cra_options import LinkTokenCreateRequestCraOptions
+from plaid.model.statements_download_request import StatementsDownloadRequest
+from plaid.model.consumer_report_permissible_purpose import ConsumerReportPermissiblePurpose
+from plaid.model.cra_check_report_base_report_get_request import CraCheckReportBaseReportGetRequest
+from plaid.model.cra_check_report_pdf_get_request import CraCheckReportPDFGetRequest
+from plaid.model.cra_check_report_income_insights_get_request import CraCheckReportIncomeInsightsGetRequest
+from plaid.model.cra_check_report_partner_insights_get_request import CraCheckReportPartnerInsightsGetRequest
+from plaid.model.cra_pdf_add_ons import CraPDFAddOns
 from plaid.api import plaid_api
-from flask import Flask
-from flask import render_template
-from flask import request
-from flask import jsonify
-from datetime import datetime
-from datetime import timedelta
-import plaid
-import base64
-import os
-import datetime
-import json
-import time
-from dotenv import load_dotenv
-from werkzeug.wrappers import response
+
 load_dotenv()
 
 
 app = Flask(__name__)
 
-# Fill in your Plaid API keys - https://dashboard.plaid.com/account/keys
 PLAID_CLIENT_ID = os.getenv('PLAID_CLIENT_ID')
 PLAID_SECRET = os.getenv('PLAID_SECRET')
-# Use 'sandbox' to test with Plaid's Sandbox environment (username: user_good,
-# password: pass_good)
-# Use `development` to test with live users and credentials and `production`
-# to go live
 PLAID_ENV = os.getenv('PLAID_ENV', 'sandbox')
-# PLAID_PRODUCTS is a comma-separated list of products to use when initializing
-# Link. Note that this list must contain 'assets' in order for the app to be
-# able to create and retrieve asset reports.
 PLAID_PRODUCTS = os.getenv('PLAID_PRODUCTS', 'transactions').split(',')
-
-# PLAID_COUNTRY_CODES is a comma-separated list of countries for which users
-# will be able to select institutions from.
 PLAID_COUNTRY_CODES = os.getenv('PLAID_COUNTRY_CODES', 'US').split(',')
-
 
 def empty_to_none(field):
     value = os.getenv(field)
@@ -86,9 +83,6 @@ host = plaid.Environment.Sandbox
 
 if PLAID_ENV == 'sandbox':
     host = plaid.Environment.Sandbox
-
-if PLAID_ENV == 'development':
-    host = plaid.Environment.Development
 
 if PLAID_ENV == 'production':
     host = plaid.Environment.Production
@@ -127,9 +121,12 @@ access_token = None
 # persistent data store.
 payment_id = None
 # The transfer_id is only relevant for Transfer ACH product.
-# We store the transfer_id in memomory - in produciton, store it in a secure
-# persistent data store
+# We store the transfer_id in memory - in production, store it in a secure
+# persistent data store.
 transfer_id = None
+# We store the user_token in memory - in production, store it in a secure
+# persistent data store.
+user_token = None
 
 item_id = None
 
@@ -175,13 +172,22 @@ def create_link_token_for_payment():
             request
         )
         pretty_print_response(response.to_dict())
+        
+        # We store the payment_id in memory for demo purposes - in production, store it in a secure
+        # persistent data store along with the Payment metadata, such as userId.
         payment_id = response['payment_id']
+        
         linkRequest = LinkTokenCreateRequest(
+            # The 'payment_initiation' product has to be the only element in the 'products' list.
             products=[Products('payment_initiation')],
             client_name='Plaid Test',
+            # Institutions from all listed countries will be shown.
             country_codes=list(map(lambda x: CountryCode(x), PLAID_COUNTRY_CODES)),
             language='en',
             user=LinkTokenCreateRequestUser(
+                # This should correspond to a unique id for the current user.
+                # Typically, this will be a user ID number from your application.
+                # Personally identifiable information, such as an email address or phone number, should not be used here.
                 client_user_id=str(time.time())
             ),
             payment_initiation=LinkTokenCreateRequestPaymentInitiation(
@@ -200,6 +206,7 @@ def create_link_token_for_payment():
 
 @app.route('/api/create_link_token', methods=['POST'])
 def create_link_token():
+    global user_token
     try:
         request = LinkTokenCreateRequest(
             products=products,
@@ -212,11 +219,62 @@ def create_link_token():
         )
         if PLAID_REDIRECT_URI!=None:
             request['redirect_uri']=PLAID_REDIRECT_URI
+        if Products('statements') in products:
+            statements=LinkTokenCreateRequestStatements(
+                end_date=date.today(),
+                start_date=date.today()-timedelta(days=30)
+            )
+            request['statements']=statements
+
+        cra_products = ["cra_base_report", "cra_income_insights", "cra_partner_insights"]
+        if any(product in cra_products for product in PLAID_PRODUCTS):
+            request['user_token'] = user_token
+            request['consumer_report_permissible_purpose'] = ConsumerReportPermissiblePurpose('ACCOUNT_REVIEW_CREDIT')
+            request['cra_options'] = LinkTokenCreateRequestCraOptions(
+                days_requested=60
+            )
     # create link token
         response = client.link_token_create(request)
         return jsonify(response.to_dict())
     except plaid.ApiException as e:
+        print(e)
         return json.loads(e.body)
+
+# Create a user token which can be used for Plaid Check, Income, or Multi-Item link flows
+# https://plaid.com/docs/api/users/#usercreate
+@app.route('/api/create_user_token', methods=['POST'])
+def create_user_token():
+    global user_token
+    try:
+        consumer_report_user_identity = None
+        user_create_request = UserCreateRequest(
+            # Typically this will be a user ID number from your application. 
+            client_user_id="user_" + str(uuid.uuid4())
+        )
+
+        cra_products = ["cra_base_report", "cra_income_insights", "cra_partner_insights"]
+        if any(product in cra_products for product in PLAID_PRODUCTS):
+            consumer_report_user_identity = ConsumerReportUserIdentity(
+                first_name="Harry",
+                last_name="Potter",
+                phone_numbers= ['+16174567890'],
+                emails= ['harrypotter@example.com'],
+                primary_address= {
+                    "city": 'New York',
+                    "region": 'NY',
+                    "street": '4 Privet Drive',
+                    "postal_code": '11111',
+                    "country": 'US'
+                }
+            )
+            user_create_request["consumer_report_user_identity"] = consumer_report_user_identity
+
+        user_response = client.user_create(user_create_request)
+        user_token = user_response['user_token']
+        return jsonify(user_response.to_dict())
+    except plaid.ApiException as e:
+        print(e)
+        return jsonify(json.loads(e.body)), e.status
 
 
 # Exchange token flow - exchange a Link public_token for
@@ -236,8 +294,6 @@ def get_access_token():
         exchange_response = client.item_public_token_exchange(exchange_request)
         access_token = exchange_response['access_token']
         item_id = exchange_response['item_id']
-        if 'transfer' in PLAID_PRODUCTS:
-            transfer_id = authorize_and_create_transfer(access_token)
         return jsonify(exchange_response.to_dict())
     except plaid.ApiException as e:
         return json.loads(e.body)
@@ -283,13 +339,21 @@ def get_transactions():
                 cursor=cursor,
             )
             response = client.transactions_sync(request).to_dict()
-            # Add this page of results
+            cursor = response['next_cursor']
+            # If no transactions are available yet, wait and poll the endpoint.
+            # Normally, we would listen for a webhook, but the Quickstart doesn't 
+            # support webhooks. For a webhook example, see 
+            # https://github.com/plaid/tutorial-resources or
+            # https://github.com/plaid/pattern
+            if cursor == '':
+                time.sleep(2)
+                continue  
+            # If cursor is not an empty string, we got results, 
+            # so add this page of results
             added.extend(response['added'])
             modified.extend(response['modified'])
             removed.extend(response['removed'])
             has_more = response['has_more']
-            # Update cursor to the next cursor
-            cursor = response['next_cursor']
             pretty_print_response(response)
 
         # Return the 8 most recent transactions
@@ -387,35 +451,14 @@ def get_assets():
         response = client.asset_report_create(request)
         pretty_print_response(response.to_dict())
         asset_report_token = response['asset_report_token']
-    except plaid.ApiException as e:
-        error_response = format_error(e)
-        return jsonify(error_response)
 
-    # Poll for the completion of the Asset Report.
-    num_retries_remaining = 20
-    asset_report_json = None
-    while num_retries_remaining > 0:
-        try:
-            request = AssetReportGetRequest(
-                asset_report_token=asset_report_token,
-            )
-            response = client.asset_report_get(request)
-            asset_report_json = response['report']
-            break
-        except plaid.ApiException as e:
-            response = json.loads(e.body)
-            if response['error_code'] == 'PRODUCT_NOT_READY':
-                num_retries_remaining -= 1
-                time.sleep(1)
-                continue
-        error_response = format_error(e)
-        return jsonify(error_response)
-    if asset_report_json is None:
-        return jsonify({'error': {'status_code': e.status, 'display_message':
-                                  'Timed out when polling for Asset Report', 'error_code': '', 'error_type': ''}})
+        # Poll for the completion of the Asset Report.
+        request = AssetReportGetRequest(
+            asset_report_token=asset_report_token,
+        )
+        response = poll_with_retries(lambda: client.asset_report_get(request))
+        asset_report_json = response['report']
 
-    asset_report_pdf = None
-    try:
         request = AssetReportPDFGetRequest(
             asset_report_token=asset_report_token,
         )
@@ -454,8 +497,8 @@ def get_holdings():
 def get_investments_transactions():
     # Pull transactions for the last 30 days
 
-    start_date = (datetime.datetime.now() - timedelta(days=(30)))
-    end_date = datetime.datetime.now()
+    start_date = (dt.datetime.now() - dt.timedelta(days=(30)))
+    end_date = dt.datetime.now()
     try:
         options = InvestmentsTransactionsGetRequestOptions()
         request = InvestmentsTransactionsGetRequest(
@@ -475,16 +518,102 @@ def get_investments_transactions():
         return jsonify(error_response)
 
 # This functionality is only relevant for the ACH Transfer product.
-# Retrieve Transfer for a specified Transfer ID
+# Authorize a transfer
 
-@app.route('/api/transfer', methods=['GET'])
-def transfer():
-    global transfer_id
+@app.route('/api/transfer_authorize', methods=['GET'])
+def transfer_authorization():
+    global authorization_id 
+    global account_id
+    request = AccountsGetRequest(access_token=access_token)
+    response = client.accounts_get(request)
+    account_id = response['accounts'][0]['account_id']
     try:
-        request = TransferGetRequest(transfer_id=transfer_id)
-        response = client.transfer_get(request)
+        request = TransferAuthorizationCreateRequest(
+            access_token=access_token,
+            account_id=account_id,
+            type=TransferType('debit'),
+            network=TransferNetwork('ach'),
+            amount='1.00',
+            ach_class=ACHClass('ppd'),
+            user=TransferAuthorizationUserInRequest(
+                legal_name='FirstName LastName',
+                email_address='foobar@email.com',
+                address=TransferUserAddressInRequest(
+                    street='123 Main St.',
+                    city='San Francisco',
+                    region='CA',
+                    postal_code='94053',
+                    country='US'
+                ),
+            ),
+        )
+        response = client.transfer_authorization_create(request)
         pretty_print_response(response.to_dict())
-        return jsonify({'error': None, 'transfer': response['transfer'].to_dict()})
+        authorization_id = response['authorization']['id']
+        return jsonify(response.to_dict())
+    except plaid.ApiException as e:
+        error_response = format_error(e)
+        return jsonify(error_response)
+
+# Create Transfer for a specified Transfer ID
+
+@app.route('/api/transfer_create', methods=['GET'])
+def transfer():
+    try:
+        request = TransferCreateRequest(
+            access_token=access_token,
+            account_id=account_id,
+            authorization_id=authorization_id,
+            description='Debit')
+        response = client.transfer_create(request)
+        pretty_print_response(response.to_dict())
+        return jsonify(response.to_dict())
+    except plaid.ApiException as e:
+        error_response = format_error(e)
+        return jsonify(error_response)
+
+@app.route('/api/statements', methods=['GET'])
+def statements():
+    try:
+        request = StatementsListRequest(access_token=access_token)
+        response = client.statements_list(request)
+        pretty_print_response(response.to_dict())
+    except plaid.ApiException as e:
+        error_response = format_error(e)
+        return jsonify(error_response)
+    try:
+        request = StatementsDownloadRequest(
+            access_token=access_token,
+            statement_id=response['accounts'][0]['statements'][0]['statement_id']
+        )
+        pdf = client.statements_download(request)
+        return jsonify({
+            'error': None,
+            'json': response.to_dict(),
+            'pdf': base64.b64encode(pdf.read()).decode('utf-8'),
+        })
+    except plaid.ApiException as e:
+        error_response = format_error(e)
+        return jsonify(error_response)
+
+
+
+
+@app.route('/api/signal_evaluate', methods=['GET'])
+def signal():
+    global account_id
+    request = AccountsGetRequest(access_token=access_token)
+    response = client.accounts_get(request)
+    account_id = response['accounts'][0]['account_id']
+    try:
+        request = SignalEvaluateRequest(
+            access_token=access_token,
+            account_id=account_id,
+            client_transaction_id='txn1234',
+            amount=100.00)
+        response = client.signal_evaluate(request)
+        pretty_print_response(response.to_dict())
+        return jsonify(response.to_dict())
     except plaid.ApiException as e:
         error_response = format_error(e)
         return jsonify(error_response)
@@ -529,6 +658,85 @@ def item():
         error_response = format_error(e)
         return jsonify(error_response)
 
+# Retrieve CRA Base Report and PDF
+# Base report: https://plaid.com/docs/check/api/#cracheck_reportbase_reportget
+# PDF: https://plaid.com/docs/check/api/#cracheck_reportpdfget
+@app.route('/api/cra/get_base_report', methods=['GET'])
+def cra_check_report():
+    try:
+        get_response = poll_with_retries(lambda: client.cra_check_report_base_report_get(
+            CraCheckReportBaseReportGetRequest(user_token=user_token, item_ids=[])
+        ))
+        pretty_print_response(get_response.to_dict())
+
+        pdf_response = client.cra_check_report_pdf_get(
+            CraCheckReportPDFGetRequest(user_token=user_token)
+        )
+        return jsonify({
+            'report': get_response.to_dict()['report'],
+            'pdf': base64.b64encode(pdf_response.read()).decode('utf-8')
+        })
+    except plaid.ApiException as e:
+        error_response = format_error(e)
+        return jsonify(error_response)
+
+# Retrieve CRA Income Insights and PDF with Insights
+# Income insights: https://plaid.com/docs/check/api/#cracheck_reportincome_insightsget
+# PDF w/ income insights: https://plaid.com/docs/check/api/#cracheck_reportpdfget
+@app.route('/api/cra/get_income_insights', methods=['GET'])
+def cra_income_insights():
+    try:
+        get_response = poll_with_retries(lambda: client.cra_check_report_income_insights_get(
+            CraCheckReportIncomeInsightsGetRequest(user_token=user_token))
+        )
+        pretty_print_response(get_response.to_dict())
+
+        pdf_response = client.cra_check_report_pdf_get(
+            CraCheckReportPDFGetRequest(user_token=user_token, add_ons=[CraPDFAddOns('cra_income_insights')]),
+        )
+
+        return jsonify({
+            'report': get_response.to_dict()['report'],
+            'pdf': base64.b64encode(pdf_response.read()).decode('utf-8')
+        })
+    except plaid.ApiException as e:
+        error_response = format_error(e)
+        return jsonify(error_response)
+
+# Retrieve CRA Partner Insights
+# https://plaid.com/docs/check/api/#cracheck_reportpartner_insightsget
+@app.route('/api/cra/get_partner_insights', methods=['GET'])
+def cra_partner_insights():
+    try:
+        response = poll_with_retries(lambda: client.cra_check_report_partner_insights_get(
+            CraCheckReportPartnerInsightsGetRequest(user_token=user_token)
+        ))
+        pretty_print_response(response.to_dict())
+
+        return jsonify(response.to_dict())
+    except plaid.ApiException as e:
+        error_response = format_error(e)
+        return jsonify(error_response)
+
+# Since this quickstart does not support webhooks, this function can be used to poll
+# an API that would otherwise be triggered by a webhook.
+# For a webhook example, see
+# https://github.com/plaid/tutorial-resources or
+# https://github.com/plaid/pattern
+def poll_with_retries(request_callback, ms=1000, retries_left=20):
+    while retries_left > 0:
+        try:
+            return request_callback()
+        except plaid.ApiException as e:
+            response = json.loads(e.body)
+            if response['error_code'] != 'PRODUCT_NOT_READY':
+                raise e
+            elif retries_left == 0:
+                raise Exception('Ran out of retries while polling') from e
+            else:
+                retries_left -= 1
+                time.sleep(ms / 1000)
+
 def pretty_print_response(response):
   print(json.dumps(response, indent=2, sort_keys=True, default=str))
 
@@ -537,70 +745,5 @@ def format_error(e):
     return {'error': {'status_code': e.status, 'display_message':
                       response['error_message'], 'error_code': response['error_code'], 'error_type': response['error_type']}}
 
-# This is a helper function to authorize and create a Transfer after successful
-# exchange of a public_token for an access_token. The transfer_id is then used
-# to obtain the data about that particular Transfer.
-def authorize_and_create_transfer(access_token):
-    try:
-        # We call /accounts/get to obtain first account_id - in production,
-        # account_id's should be persisted in a data store and retrieved
-        # from there.
-        request = AccountsGetRequest(access_token=access_token)
-        response = client.accounts_get(request)
-        account_id = response['accounts'][0]['account_id']
-
-        request = TransferAuthorizationCreateRequest(
-            access_token=access_token,
-            account_id=account_id,
-            type=TransferType('credit'),
-            network=TransferNetwork('ach'),
-            amount='1.34',
-            ach_class=ACHClass('ppd'),
-            user=TransferUserInRequest(
-                legal_name='FirstName LastName',
-                email_address='foobar@email.com',
-                address=TransferUserAddressInRequest(
-                    street='123 Main St.',
-                    city='San Francisco',
-                    region='CA',
-                    postal_code='94053',
-                    country='US'
-                ),
-            ),
-        )
-        response = client.transfer_authorization_create(request)
-        pretty_print_response(response)
-        authorization_id = response['authorization']['id']
-
-        request = TransferCreateRequest(
-            idempotency_key=TransferCreateIdempotencyKey('1223abc456xyz7890001'),
-            access_token=access_token,
-            account_id=account_id,
-            authorization_id=authorization_id,
-            type=TransferType('credit'),
-            network=TransferNetwork('ach'),
-            amount='1.34',
-            description='Payment',
-            ach_class=ACHClass('ppd'),
-            user=TransferUserInRequest(
-                legal_name='FirstName LastName',
-                email_address='foobar@email.com',
-                address=TransferUserAddressInRequest(
-                    street='123 Main St.',
-                    city='San Francisco',
-                    region='CA',
-                    postal_code='94053',
-                    country='US'
-                ),
-            ),
-        )
-        response = client.transfer_create(request)
-        pretty_print_response(response)
-        return response['transfer']['id']
-    except plaid.ApiException as e:
-        error_response = format_error(e)
-        return jsonify(error_response)
-
-
 if __name__ == '__main__':
-    app.run(port=os.getenv('PORT', 8000))
+    app.run(port=int(os.getenv('PORT', 8000)))

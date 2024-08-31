@@ -2,7 +2,17 @@
 
 This repository accompanies Plaid's [**quickstart guide**][quickstart].
 
-Here you'll find full example integration apps using our [**client libraries**][libraries]:
+Here you'll find full example integration apps using our [**client libraries**][libraries].
+
+This Quickstart is designed to show as many products and configurations as possible, including all five officially supported client libraries and multiple Plaid APIs, against a React frontend. 
+
+If you prefer a non-React frontend platform, or a more minimal backend in one language with one endpoint, see the [Tiny Quickstart](https://github.com/plaid/tiny-quickstart), which shows a simpler backend and is available for JavaScript, Next.js, React, and React Native frontends.
+
+For Identity Verification, see the [Identity Verification Quickstart](https://github.com/plaid/idv-quickstart). 
+
+For Income, see the [Income sample app](https://github.com/plaid/income-sample). 
+
+For a more in-depth Transfer Quickstart, see the [Transfer Quickstart](https://github.com/plaid/transfer-quickstart) (Node only).
 
 ![Plaid quickstart app](/assets/quickstart.jpeg)
 
@@ -31,8 +41,8 @@ Here you'll find full example integration apps using our [**client libraries**][
       - [View the logs](#view-the-logs)
       - [Stop the container](#stop-the-container)
 - [Test credentials](#test-credentials)
+- [Troubleshooting](#troubleshooting)
 - [Testing OAuth](#testing-oauth)
-- [Payment Initiation](#payment-initiation)
 
 <!-- tocstop -->
 
@@ -68,7 +78,7 @@ cp .env.example .env
 
 Copy `.env.example` to a new file called `.env` and fill out the environment variables inside. At
 minimum `PLAID_CLIENT_ID` and `PLAID_SECRET` must be filled out. Get your Client ID and secrets from
-the dashboard: https://dashboard.plaid.com/account/keys
+the dashboard: [https://dashboard.plaid.com/developers/keys](https://dashboard.plaid.com/developers/keys)
 
 > NOTE: `.env` files are a convenient local development tool. Never run a production application
 > using an environment file with secrets in it.
@@ -98,7 +108,7 @@ Once started with one of the commands below, the quickstart will be running on h
 
 ```bash
 $ cd ./node
-$ npm ci
+$ npm install
 $ ./start.sh
 ```
 
@@ -163,9 +173,9 @@ A community-supported implementation of the Plaid Quickstart using the [Going.Pl
 #### 2. Running the frontend
 
 ```bash
-$ cd ./frontend
-$ npm ci
-$ npm start
+cd ./frontend
+npm ci
+npm start
 ```
 
 ### Run with Docker
@@ -220,20 +230,45 @@ make stop language=node
 
 In Sandbox, you can log in to any supported institution (except Capital One) using `user_good` as the username and `pass_good` as the password. If prompted to enter a 2-factor authentication code, enter `1234`.
 
-In Development or Production, use real-life credentials.
+In Production, use real-life credentials.
 
-## Testing OAuth
+## Troubleshooting
 
-Some institutions (primarily in Europe, but a small number in the US) require an OAuth redirect
+### Can't get a link token, or API calls are 400ing
+
+View the server logs to see the associated error message with detailed troubleshooting instructions. If you can't view logs locally, view them via the [Dashboard activity logs](https://dashboard.plaid.com/activity/logs). 
+
+### Works only when `PLAID_REDIRECT_URI` is not specified
+Make sure to add the redirect URI to the Allowed Redirect URIs list in the [Plaid Dashboard](https://dashboard.plaid.com/team/api).
+
+### "Connectivity not supported"
+
+If you get a "Connectivity not supported" error after selecting a financial institution in Link, you probably specified some products in your .env file that the target financial institution doesn't support. Remove the unsupported products and try again.
+
+### "You need to update your app" or "institution not supported"
+
+If you get a "You need to update your app" or "institution not supported" error after selecting a financial institution in Link, you're probably running the Quickstart in Production and attempting to link an institution, such as Chase or Wells Fargo, that requires an OAuth-based connection. In order to make OAuth connections to US-based institutions in Production, you must have full Production access approval, and certain institutions may also require additional approvals before you can be enabled. To use this institution, [apply for full Production access](https://dashboard.plaid.com/overview/production) and see the [OAuth insitutions page](https://dashboard.plaid.com/team/oauth-institutions) for any other required steps and to track your OAuth enablement status.
+
+### "oauth uri does not contain a valid oauth_state_id query parameter"
+
+If you get the console error "oauth uri does not contain a valid oauth_state_id query parameter", you are attempting to initialize Link with a redirect uri when it is not necessary to do so. The `receivedRedirectUri` should not be set when initializing Link for the first time. It is used when initializing Link for the second time, after returning from the OAuth redirect.
+
+## Testing OAuth 
+
+Some institutions require an OAuth redirect
 authentication flow, where the end user is redirected to the bank’s website or mobile app to
-authenticate. To test this flow in sandbox, you should set `PLAID_REDIRECT_URI=http://localhost:3000/` in `.env`. You will also need to register this localhost redirect URI in the
-[Plaid dashboard under Team Settings > API > Allowed redirect URIs][dashboard-api-section].
+authenticate. 
 
-To test the OAuth flow in sandbox, choose 'Playtypus OAuth Bank' from the list of financial institutions in Plaid Link.
+To test the OAuth flow in Sandbox, select any institution that uses an OAuth connection with Plaid (a partial list can be found on the [Dashboard OAuth Institutions page](https://dashboard.plaid.com/team/oauth-institutions)), or choose 'Platypus OAuth Bank' from the list of financial institutions in Plaid Link.
 
-### Instructions for using https with localhost
+### Testing OAuth with a redirect URI (optional)
 
-If you want to test OAuth in development, you need to use https and set `PLAID_REDIRECT_URI=https://localhost:3000/` in `.env`. In order to run your localhost on https, you will need to create a self-signed certificate and add it to the frontend root folder. You can use the following instructions to do this. Note that self-signed certificates should be used for testing purposes only, never for actual deployments.
+To test the OAuth flow in Sandbox with a [redirect URI](https://www.plaid.com/docs/link/oauth/#create-and-register-a-redirect-uri), you should set `PLAID_REDIRECT_URI=http://localhost:3000/` in `.env`. You will also need to register this localhost redirect URI in the
+[Plaid dashboard under Developers > API > Allowed redirect URIs][dashboard-api-section]. It is not required to configure a redirect URI in the .env file to use OAuth with the Quickstart. 
+
+#### Instructions for using https with localhost
+
+If you want to test OAuth in development with a redirect URI, you need to use https and set `PLAID_REDIRECT_URI=https://localhost:3000/` in `.env`. In order to run your localhost on https, you will need to create a self-signed certificate and add it to the frontend root folder. You can use the following instructions to do this. Note that self-signed certificates should be used for testing purposes only, never for actual deployments.
 
 In your terminal, change to the frontend folder:
 
@@ -271,12 +306,6 @@ with this line instead:
 After starting up the Quickstart, you can now view it at https://localhost:3000. If you are on Windows, you
 may still get an invalid certificate warning on your browser. If so, click on "advanced" and proceed. Also on Windows, the frontend may still try to load http://localhost:3000 and you may have to access https://localhost:3000 manually.
 
-## Payment Initiation
-
-If you want to use the [Payment
-Initiation][payment-initiation] product, you will need to [contact Sales][contact-sales] to get this
-product enabled.
-
 [quickstart]: https://plaid.com/docs/quickstart
 [libraries]: https://plaid.com/docs/api/libraries
 [payment-initiation]: https://plaid.com/docs/payment-initiation/
@@ -286,5 +315,5 @@ product enabled.
 [java-example]: /java
 [go-example]: /go
 [docker]: https://www.docker.com
-[dashboard-api-section]: https://dashboard.plaid.com/team/api
+[dashboard-api-section]: https://dashboard.plaid.com/developers/api
 [contact-sales]: https://plaid.com/contact

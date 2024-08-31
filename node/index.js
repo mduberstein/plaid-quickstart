@@ -2,8 +2,9 @@
 
 // read env vars from .env file
 require('dotenv').config();
-const { Configuration, PlaidApi, PlaidEnvironments } = require('plaid');
+const { Configuration, PlaidApi, Products, PlaidEnvironments, CraCheckReportProduct } = require('plaid');
 const util = require('util');
+const { v4: uuidv4 } = require('uuid');
 const express = require('express');
 const bodyParser = require('body-parser');
 const moment = require('moment');
@@ -14,10 +15,12 @@ const PLAID_CLIENT_ID = process.env.PLAID_CLIENT_ID;
 const PLAID_SECRET = process.env.PLAID_SECRET;
 const PLAID_ENV = process.env.PLAID_ENV || 'sandbox';
 
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
 // PLAID_PRODUCTS is a comma-separated list of products to use when initializing
 // Link. Note that this list must contain 'assets' in order for the app to be
 // able to create and retrieve asset reports.
-const PLAID_PRODUCTS = (process.env.PLAID_PRODUCTS || 'transactions').split(
+const PLAID_PRODUCTS = (process.env.PLAID_PRODUCTS || Products.Transactions).split(
   ',',
 );
 
@@ -43,15 +46,18 @@ const PLAID_ANDROID_PACKAGE_NAME = process.env.PLAID_ANDROID_PACKAGE_NAME || '';
 // We store the access_token in memory - in production, store it in a secure
 // persistent data store
 let ACCESS_TOKEN = null;
+let USER_TOKEN = null;
 let PUBLIC_TOKEN = null;
 let ITEM_ID = null;
-// The payment_id is only relevant for the UK Payment Initiation product.
+let ACCOUNT_ID = null;
+// The payment_id is only relevant for the UK/EU Payment Initiation product.
 // We store the payment_id in memory - in production, store it in a secure
-// persistent data store
+// persistent data store along with the Payment metadata, such as userId .
 let PAYMENT_ID = null;
-// The transfer_id is only relevant for Transfer ACH product.
+// The transfer_id and authorization_id are only relevant for Transfer ACH product.
 // We store the transfer_id in memory - in production, store it in a secure
 // persistent data store
+let AUTHORIZATION_ID = null;
 let TRANSFER_ID = null;
 
 // Initialize the Plaid client
@@ -110,6 +116,22 @@ app.post('/api/create_link_token', function (request, response, next) {
       if (PLAID_ANDROID_PACKAGE_NAME !== '') {
         configs.android_package_name = PLAID_ANDROID_PACKAGE_NAME;
       }
+      if (PLAID_PRODUCTS.includes(Products.Statements)) {
+        const statementConfig = {
+          end_date: moment().format('YYYY-MM-DD'),
+          start_date: moment().subtract(30, 'days').format('YYYY-MM-DD'),
+        }
+        configs.statements = statementConfig;
+      }
+
+      const craEnumValues = Object.values(CraCheckReportProduct);
+      if (PLAID_PRODUCTS.some(product => craEnumValues.includes(product))) {
+        configs.user_token = USER_TOKEN;
+        configs.cra_options = {
+          days_requested: 60
+        };
+        configs.consumer_report_permissible_purpose = 'ACCOUNT_REVIEW_CREDIT';
+      }
       const createTokenResponse = await client.linkTokenCreate(configs);
       prettyPrintResponse(createTokenResponse);
       response.json(createTokenResponse.data);
@@ -117,8 +139,45 @@ app.post('/api/create_link_token', function (request, response, next) {
     .catch(next);
 });
 
-// Create a link token with configs which we can then use to initialize Plaid Link client-side.
-// See https://plaid.com/docs/#payment-initiation-create-link-token-request
+// Create a user token which can be used for Plaid Check, Income, or Multi-Item link flows
+// https://plaid.com/docs/api/users/#usercreate
+app.post('/api/create_user_token', function (request, response, next) {
+  Promise.resolve()
+    .then(async function () {
+
+      const request = {
+         // Typically this will be a user ID number from your application. 
+        client_user_id: 'user_' + uuidv4()
+      }
+      
+      const craEnumValues = Object.values(CraCheckReportProduct);
+      if (PLAID_PRODUCTS.some(product => craEnumValues.includes(product))) {
+        request.consumer_report_user_identity = {
+          first_name: 'Harry',
+          last_name: 'Potter',
+          phone_numbers: ['+16174567890'],
+          emails: ['harrypotter@example.com'],
+          primary_address: {
+            city: 'New York',
+            region: 'NY',
+            street: '4 Privet Drive',
+            postal_code: '11111',
+            country: 'US'
+          }
+        }
+      }
+      const user = await client.userCreate(request);
+      USER_TOKEN = user.data.user_token
+      response.json(user.data);
+    }).catch(next);
+});
+
+
+// Create a link token with configs which we can then use to initialize Plaid Link client-side
+// for a 'payment-initiation' flow.
+// See:
+// - https://plaid.com/docs/payment-initiation/
+// - https://plaid.com/docs/#payment-initiation-create-link-token-request
 app.post(
   '/api/create_link_token_for_payment',
   function (request, response, next) {
@@ -149,16 +208,24 @@ app.post(
           });
         prettyPrintResponse(createPaymentResponse);
         const paymentId = createPaymentResponse.data.payment_id;
+
+        // We store the payment_id in memory for demo purposes - in production, store it in a secure
+        // persistent data store along with the Payment metadata, such as userId.
         PAYMENT_ID = paymentId;
+
         const configs = {
+          client_name: 'Plaid Quickstart',
           user: {
             // This should correspond to a unique id for the current user.
-            client_user_id: 'user-id',
+            // Typically, this will be a user ID number from your application.
+            // Personally identifiable information, such as an email address or phone number, should not be used here.
+            client_user_id: uuidv4(),
           },
-          client_name: 'Plaid Quickstart',
-          products: PLAID_PRODUCTS,
+          // Institutions from all listed countries will be shown.
           country_codes: PLAID_COUNTRY_CODES,
           language: 'en',
+          // The 'payment_initiation' product has to be the only element in the 'products' list.
+          products: [Products.PaymentInitiation],
           payment_initiation: {
             payment_id: paymentId,
           },
@@ -187,10 +254,8 @@ app.post('/api/set_access_token', function (request, response, next) {
       prettyPrintResponse(tokenResponse);
       ACCESS_TOKEN = tokenResponse.data.access_token;
       ITEM_ID = tokenResponse.data.item_id;
-      if (PLAID_PRODUCTS.includes('transfer')) {
-        TRANSFER_ID = await authorizeAndCreateTransfer(ACCESS_TOKEN);
-      }
       response.json({
+        // the 'access_token' is a private token, DO NOT pass this token to the frontend in your production environment
         access_token: ACCESS_TOKEN,
         item_id: ITEM_ID,
         error: null,
@@ -235,20 +300,31 @@ app.get('/api/transactions', function (request, response, next) {
         };
         const response = await client.transactionsSync(request)
         const data = response.data;
+
+        // If no transactions are available yet, wait and poll the endpoint.
+        // Normally, we would listen for a webhook, but the Quickstart doesn't
+        // support webhooks. For a webhook example, see
+        // https://github.com/plaid/tutorial-resources or
+        // https://github.com/plaid/pattern
+        cursor = data.next_cursor;
+        if (cursor === "") {
+          await sleep(2000);
+          continue;
+        }
+
         // Add this page of results
         added = added.concat(data.added);
         modified = modified.concat(data.modified);
         removed = removed.concat(data.removed);
         hasMore = data.has_more;
-        // Update cursor to the next cursor
-        cursor = data.next_cursor;
+
         prettyPrintResponse(response);
       }
 
       const compareTxnsByDateAscending = (a, b) => (a.date > b.date) - (a.date < b.date);
       // Return the 8 most recent transactions
       const recently_added = [...added].sort(compareTxnsByDateAscending).slice(-8);
-      response.json({latest_transactions: recently_added});
+      response.json({ latest_transactions: recently_added });
     })
     .catch(next);
 });
@@ -345,7 +421,7 @@ app.get('/api/item', function (request, response, next) {
       // Also pull information about the institution
       const configs = {
         institution_id: itemResponse.data.item.institution_id,
-        country_codes: ['US'],
+        country_codes: PLAID_COUNTRY_CODES,
       };
       const instResponse = await client.institutionsGetById(configs);
       prettyPrintResponse(itemResponse);
@@ -428,22 +504,29 @@ app.get('/api/assets', function (request, response, next) {
     .catch(next);
 });
 
-app.get('/api/transfer', function (request, response, next) {
+app.get('/api/statements', function (request, response, next) {
   Promise.resolve()
     .then(async function () {
-      const transferGetResponse = await client.transferGet({
-        transfer_id: TRANSFER_ID,
+      const statementsListResponse = await client.statementsList({ access_token: ACCESS_TOKEN });
+      prettyPrintResponse(statementsListResponse);
+      const pdfRequest = {
+        access_token: ACCESS_TOKEN,
+        statement_id: statementsListResponse.data.accounts[0].statements[0].statement_id
+      };
+
+      const statementsDownloadResponse = await client.statementsDownload(pdfRequest, {
+        responseType: 'arraybuffer',
       });
-      prettyPrintResponse(transferGetResponse);
+      prettyPrintResponse(statementsDownloadResponse);
       response.json({
-        error: null,
-        transfer: transferGetResponse.data.transfer,
+        json: statementsListResponse.data,
+        pdf: statementsDownloadResponse.data.toString('base64'),
       });
     })
     .catch(next);
 });
 
-// This functionality is only relevant for the UK Payment Initiation product.
+// This functionality is only relevant for the UK/EU Payment Initiation product.
 // Retrieve Payment for a specified Payment ID
 app.get('/api/payment', function (request, response, next) {
   Promise.resolve()
@@ -457,23 +540,19 @@ app.get('/api/payment', function (request, response, next) {
     .catch(next);
 });
 
-//TO-DO: This endpoint will be deprecated in the near future
+// This endpoint is still supported but is no longer recommended
+// For Income best practices, see https://github.com/plaid/income-sample instead
 app.get('/api/income/verification/paystubs', function (request, response, next) {
   Promise.resolve()
-  .then(async function () {
-    const paystubsGetResponse = await client.incomeVerificationPaystubsGet({
-      access_token: ACCESS_TOKEN
-    });
-    prettyPrintResponse(paystubsGetResponse);
-    response.json({ error: null, paystubs: paystubsGetResponse.data})
-  })
-  .catch(next);
+    .then(async function () {
+      const paystubsGetResponse = await client.incomeVerificationPaystubsGet({
+        access_token: ACCESS_TOKEN
+      });
+      prettyPrintResponse(paystubsGetResponse);
+      response.json({ error: null, paystubs: paystubsGetResponse.data })
+    })
+    .catch(next);
 })
-
-app.use('/api', function (error, request, response, next) {
-  prettyPrintResponse(error.response);
-  response.json(formatError(error.response));
-});
 
 const server = app.listen(APP_PORT, function () {
   console.log('plaid-quickstart server listening on port ' + APP_PORT);
@@ -493,30 +572,17 @@ const getAssetReportWithRetries = (
   asset_report_token,
   ms = 1000,
   retriesLeft = 20,
-) =>
-  new Promise((resolve, reject) => {
-    const request = {
-      asset_report_token,
-    };
+) => {
+  const request = {
+    asset_report_token,
+  };
 
-    plaidClient
-      .assetReportGet(request)
-      .then(resolve)
-      .catch(() => {
-        setTimeout(() => {
-          if (retriesLeft === 1) {
-            reject('Ran out of retries while polling for asset report');
-            return;
-          }
-          getAssetReportWithRetries(
-            plaidClient,
-            asset_report_token,
-            ms,
-            retriesLeft - 1,
-          ).then(resolve);
-        }, ms);
-      });
-  });
+  return pollWithRetries(
+    async () => {
+      return await plaidClient.assetReportGet(request);
+    }
+  );
+}
 
 const formatError = (error) => {
   return {
@@ -524,64 +590,211 @@ const formatError = (error) => {
   };
 };
 
-// This is a helper function to authorize and create a Transfer after successful
-// exchange of a public_token for an access_token. The TRANSFER_ID is then used
-// to obtain the data about that particular Transfer.
+app.get('/api/transfer_authorize', function (request, response, next) {
+  Promise.resolve()
+    .then(async function () {
+      const accountsResponse = await client.accountsGet({
+        access_token: ACCESS_TOKEN,
+      });
+      ACCOUNT_ID = accountsResponse.data.accounts[0].account_id;
 
-const authorizeAndCreateTransfer = async (accessToken) => {
-  // We call /accounts/get to obtain first account_id - in production,
-  // account_id's should be persisted in a data store and retrieved
-  // from there.
-  const accountsResponse = await client.accountsGet({
-    access_token: accessToken,
-  });
-  const accountId = accountsResponse.data.accounts[0].account_id;
-
-  const transferAuthorizationResponse =
-    await client.transferAuthorizationCreate({
-      access_token: accessToken,
-      account_id: accountId,
-      type: 'credit',
-      network: 'ach',
-      amount: '1.34',
-      ach_class: 'ppd',
-      user: {
-        legal_name: 'FirstName LastName',
-        email_address: 'foobar@email.com',
-        address: {
-          street: '123 Main St.',
-          city: 'San Francisco',
-          region: 'CA',
-          postal_code: '94053',
-          country: 'US',
+      const transferAuthorizationCreateResponse = await client.transferAuthorizationCreate({
+        access_token: ACCESS_TOKEN,
+        account_id: ACCOUNT_ID,
+        type: 'debit',
+        network: 'ach',
+        amount: '1.00',
+        ach_class: 'ppd',
+        user: {
+          legal_name: 'FirstName LastName',
+          email_address: 'foobar@email.com',
+          address: {
+            street: '123 Main St.',
+            city: 'San Francisco',
+            region: 'CA',
+            postal_code: '94053',
+            country: 'US',
+          },
         },
-      },
-    });
-  prettyPrintResponse(transferAuthorizationResponse);
-  const authorizationId = transferAuthorizationResponse.data.authorization.id;
+      });
+      prettyPrintResponse(transferAuthorizationCreateResponse);
+      AUTHORIZATION_ID = transferAuthorizationCreateResponse.data.authorization.id;
+      response.json(transferAuthorizationCreateResponse.data);
+    })
+    .catch(next);
+});
 
-  const transferResponse = await client.transferCreate({
-    idempotency_key: '1223abc456xyz7890001',
-    access_token: accessToken,
-    account_id: accountId,
-    authorization_id: authorizationId,
-    type: 'credit',
-    network: 'ach',
-    amount: '12.34',
-    description: 'Payment',
-    ach_class: 'ppd',
-    user: {
-      legal_name: 'FirstName LastName',
-      email_address: 'foobar@email.com',
-      address: {
-        street: '123 Main St.',
-        city: 'San Francisco',
-        region: 'CA',
-        postal_code: '94053',
-        country: 'US',
-      },
-    },
+
+app.get('/api/transfer_create', function (request, response, next) {
+  Promise.resolve()
+    .then(async function () {
+      const transferCreateResponse = await client.transferCreate({
+        access_token: ACCESS_TOKEN,
+        account_id: ACCOUNT_ID,
+        authorization_id: AUTHORIZATION_ID,
+        description: 'Debit',
+      });
+      prettyPrintResponse(transferCreateResponse);
+      TRANSFER_ID = transferCreateResponse.data.transfer.id
+      response.json({
+        error: null,
+        transfer: transferCreateResponse.data.transfer,
+      });
+    })
+    .catch(next);
+});
+
+app.get('/api/signal_evaluate', function (request, response, next) {
+  Promise.resolve()
+    .then(async function () {
+      const accountsResponse = await client.accountsGet({
+        access_token: ACCESS_TOKEN,
+      });
+      ACCOUNT_ID = accountsResponse.data.accounts[0].account_id;
+
+      const signalEvaluateResponse = await client.signalEvaluate({
+        access_token: ACCESS_TOKEN,
+        account_id: ACCOUNT_ID,
+        client_transaction_id: 'txn1234',
+        amount: 100.00,
+      });
+      prettyPrintResponse(signalEvaluateResponse);
+      response.json(signalEvaluateResponse.data);
+    })
+    .catch(next);
+});
+
+// Retrieve CRA Base Report and PDF
+// Base report: https://plaid.com/docs/check/api/#cracheck_reportbase_reportget
+// PDF: https://plaid.com/docs/check/api/#cracheck_reportpdfget
+app.get('/api/cra/get_base_report', function (request, response, next) {
+  Promise.resolve()
+    .then(async function () {
+      const getResponse = await getCraBaseReportWithRetries(client, USER_TOKEN);
+      prettyPrintResponse(getResponse);
+
+      const pdfResponse = await client.craCheckReportPdfGet({
+        user_token: USER_TOKEN,
+      }, {
+        responseType: 'arraybuffer'
+      });
+
+      response.json({
+        report: getResponse.data.report,
+        pdf: pdfResponse.data.toString('base64'),
+      });
+    })
+    .catch(next);
+});
+
+const getCraBaseReportWithRetries = (
+  plaidClient,
+  userToken
+) => pollWithRetries(
+  async () => {
+    return await plaidClient.craCheckReportBaseReportGet(
+      {
+        user_token: userToken
+      }
+    )
+  }
+);
+
+// Retrieve CRA Income Insights and PDF with Insights
+// Income insights: https://plaid.com/docs/check/api/#cracheck_reportincome_insightsget
+// PDF w/ income insights: https://plaid.com/docs/check/api/#cracheck_reportpdfget
+app.get('/api/cra/get_income_insights', async (req, res, next) => {
+  Promise.resolve()
+    .then(async function () {
+      const getResponse = await getCheckInsightsWithRetries(client, USER_TOKEN)
+      prettyPrintResponse(getResponse);
+
+      const pdfResponse = await client.craCheckReportPdfGet({
+        user_token: USER_TOKEN,
+        add_ons: ['cra_income_insights']
+      }, {
+        responseType: 'arraybuffer'
+      });
+
+      res.json({
+        report: getResponse.data.report,
+        pdf: pdfResponse.data.toString('base64'),
+      });
+    })
+    .catch(next);
+});
+
+
+const getCheckInsightsWithRetries = (
+  plaidClient,
+  userToken
+) => pollWithRetries(
+  async () => {
+    return await plaidClient.craCheckReportIncomeInsightsGet(
+      {
+        user_token: userToken
+      }
+    );
+  }
+);
+
+// Retrieve CRA Partner Insights
+// https://plaid.com/docs/check/api/#cracheck_reportpartner_insightsget
+app.get('/api/cra/get_partner_insights', async (req, res, next) => {
+  Promise.resolve()
+    .then(async function () {
+      const response = await getCheckParnterInsightsWithRetries(client, USER_TOKEN);
+      prettyPrintResponse(response);
+
+      res.json(response.data);
+    })
+    .catch(next);
+});
+
+
+const getCheckParnterInsightsWithRetries = (
+  plaidClient,
+  userToken
+) => pollWithRetries(
+  async () => {
+    return await plaidClient.craCheckReportPartnerInsightsGet(
+      {
+        user_token: userToken
+      }
+    );
+  }
+);
+
+// Since this quickstart does not support webhooks, this function can be used to poll
+// an API that would otherwise be triggered by a webhook.
+// For a webhook example, see
+// https://github.com/plaid/tutorial-resources or
+// https://github.com/plaid/pattern
+const pollWithRetries = (
+  requestCallback,
+  ms = 1000,
+  retriesLeft = 20,
+) =>
+  new Promise((resolve, reject) => {
+    requestCallback()
+      .then(resolve)
+      .catch(() => {
+        setTimeout(() => {
+          if (retriesLeft === 1) {
+            reject('Ran out of retries while polling');
+            return;
+          }
+          pollWithRetries(
+            requestCallback,
+            ms,
+            retriesLeft - 1,
+          ).then(resolve);
+        }, ms);
+      });
   });
-  prettyPrintResponse(transferResponse);
-  return transferResponse.data.transfer.id;
-};
+
+app.use('/api', function (error, request, response, next) {
+  console.log(error);
+  prettyPrintResponse(error.response);
+  response.json(formatError(error.response));
+});
